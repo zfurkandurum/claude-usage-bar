@@ -423,8 +423,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         popover.behavior = CommandLine.arguments.contains("--open-popover") ? .applicationDefined : .transient   // flag: stays open for screenshots
-        popover.contentViewController = NSHostingController(
+        let host = NSHostingController(
             rootView: PopoverView(m: model, openSettings: { [weak self] in self?.openSettings() }))
+        host.sizingOptions = [.preferredContentSize]
+        popover.contentViewController = host
 
         if let b = item.button {
             b.target = self
@@ -501,6 +503,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let b = item.button else { return }
         if popover.isShown { popover.performClose(nil); return }
         model.refresh()   // no-op while backing off after a 429
+        // Give the popover its real size up front; otherwise it is placed using a stale size and floats below the menu bar.
+        if let v = popover.contentViewController?.view {
+            v.layoutSubtreeIfNeeded()
+            popover.contentSize = v.fittingSize
+        }
         popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -508,17 +515,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func openSettings() {
         popover.performClose(nil)
         if settingsWindow == nil {
-            let w = NSWindow(contentViewController: NSHostingController(rootView: SettingsView(m: model)))
+            let host = NSHostingController(rootView: SettingsView(m: model))
+            let w = NSWindow(contentViewController: host)
             w.title = L("Claude Usage Bar — Settings", "Claude Usage Bar — Ayarlar")
             w.styleMask = [.titled, .closable]
             w.isReleasedWhenClosed = false
-            w.center()
+            w.setContentSize(host.view.fittingSize)
             settingsWindow = w
         }
+        if let w = settingsWindow, !w.isVisible {
+            // Exact center of the screen the mouse is on (NSWindow.center() sits above center).
+            let mouse = NSEvent.mouseLocation
+            let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
+            if let vf = screen?.visibleFrame {
+                w.setFrameOrigin(NSPoint(x: vf.midX - w.frame.width / 2, y: vf.midY - w.frame.height / 2))
+            }
+        }
         NSApp.activate(ignoringOtherApps: true)
-        settingsWindow?.level = .floating
         settingsWindow?.makeKeyAndOrderFront(nil)
-        settingsWindow?.orderFrontRegardless()
     }
 
     // MARK: Title
