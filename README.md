@@ -1,118 +1,140 @@
 # Claude Usage Bar
 
-A tiny macOS menu bar app that shows how much of your **Claude subscription
-limit** (Pro / Max) you have left — the **5-hour** window, and optionally the
-**weekly** one — right next to Wi-Fi and the clock.
+A lightweight macOS menu bar app that shows how much of your Claude subscription
+usage limit is left — the 5-hour window and, optionally, the weekly one.
 
-```
- 76%            ← 5-hour limit remaining
- 76% · 19%      ← 5-hour · weekly (optional)
-```
+Claude Code's `/usage` command shows these numbers, but only inside a terminal
+session. Claude Usage Bar keeps them visible at all times.
 
-- Text only, no icon — takes very little menu bar space
-- Turns orange under 25% and red under 10% remaining
-- **Click** the number for a small panel: progress bars for the 5-hour and weekly limits, time until reset, refresh, **Settings…** and **Quit**
-- **Right-click** (or Ctrl-click) for a quick Settings / Refresh / Quit menu
-- Settings window: show weekly limit in the bar, show *used* instead of *remaining*, launch at login, refresh interval
-- **Launch at login** (enabled on first run, can be switched off in Settings)
-- Refreshes every 2 min (configurable) and after wake from sleep
-- Native Swift, no dependencies, no Dock icon, universal (Apple Silicon + Intel), macOS 13+
-- English and Turkish UI (follows system language)
+## Features
+
+- Remaining 5-hour limit as a compact percentage in the menu bar, with the weekly limit as an option
+- Color warning when the limit runs low (orange below 25%, red below 10%)
+- Click for a detail panel: progress bars, time until each limit resets, signed-in account and plan
+- Right-click for a quick menu (Settings, Refresh, Quit)
+- Settings window: weekly limit in the bar, remaining vs. used, refresh interval, launch at login
+- Starts automatically at login (on by default, can be disabled in Settings)
+- Native Swift, no dependencies, no Dock icon, universal binary (Apple Silicon and Intel), macOS 13+
+- English and Turkish interface, chosen from the system language
 
 ## Requirements
 
-You must be signed in to [Claude Code](https://claude.com/claude-code) on the
-Mac (`claude` → log in with your Claude account). The app reuses that login to
-read your usage; it has no login of its own.
+- macOS 13 or later
+- A Claude Pro or Max subscription
+- [Claude Code](https://claude.com/claude-code) installed and signed in on the same Mac
 
-## Install
+The app has no login of its own. It reuses the Claude Code sign-in.
 
-### Build from source (recommended)
+## Installation
 
-Needs Xcode or the Xcode Command Line Tools (`xcode-select --install`).
+### Build from source
+
+Requires Xcode or the Command Line Tools (`xcode-select --install`).
 
 ```sh
 git clone https://github.com/zfurkandurum/claude-usage-bar.git
 cd claude-usage-bar
-./build.sh            # installs to ~/Applications/ClaudeUsageBar.app
+./build.sh
 open ~/Applications/ClaudeUsageBar.app
 ```
 
+`build.sh` installs the app to `~/Applications`. Pass a directory to install elsewhere:
+`./build.sh /Applications`.
+
 ### Prebuilt release
 
-Download `ClaudeUsageBar.zip` from the Releases page, unzip, move the app to
-`~/Applications` (or `/Applications`). The app is ad-hoc signed, not notarized,
-so macOS will block the first launch:
+Download `ClaudeUsageBar.zip` from the [Releases](https://github.com/zfurkandurum/claude-usage-bar/releases)
+page and move the app to `/Applications`. The app is ad-hoc signed and not notarized, so
+macOS blocks the first launch. Remove the quarantine flag once:
 
 ```sh
 xattr -dr com.apple.quarantine /Applications/ClaudeUsageBar.app
 ```
 
-(or right-click → Open).
+### First launch
 
-### First run
+macOS asks whether the app may access the `Claude Code-credentials` Keychain item.
+Choose **Always Allow**, otherwise the prompt returns on every refresh.
 
-macOS will ask whether `ClaudeUsageBar` may access the *Claude Code-credentials*
-Keychain item. Choose **Always Allow**.
+## Usage
+
+| Action | Result |
+| --- | --- |
+| Click the percentage | Opens the detail panel |
+| Right-click or Ctrl-click | Opens the Settings / Refresh / Quit menu |
+| Settings → Menu bar | Show the weekly limit, switch between remaining and used |
+| Settings → General | Launch at login, refresh interval (1, 2, 5 or 10 minutes) |
+
+## Accounts
+
+The bar shows the limits of the account Claude Code is currently signed into on
+this Mac. That account (email and plan) is displayed in the panel and in Settings.
+
+- **Switching accounts** with `claude /login`, or with a tool that swaps the Keychain
+  login, takes effect on the next refresh. Cached values are stored per account and are
+  never shown for a different one.
+- **Separate config folders** (`CLAUDE_CONFIG_DIR`): choose the folder under
+  Settings → Account. The app then reads `<folder>/.credentials.json` and `<folder>/.claude.json`.
+- Only one account is tracked at a time.
+- API-key and Console sign-ins have no subscription limits, so there is nothing to display for them.
 
 ## How it works
 
-Claude Code stores its OAuth token in the macOS Keychain (item
-`Claude Code-credentials`, or `$CLAUDE_CONFIG_DIR/.credentials.json`). The app
-reads it with `/usr/bin/security` on every refresh and calls
+Claude Code stores its OAuth login in the macOS Keychain (item `Claude Code-credentials`),
+or in `<config folder>/.credentials.json` when a custom folder is used. On each refresh the
+app reads that token with `/usr/bin/security` and requests
 
 ```
 GET https://api.anthropic.com/api/oauth/usage
 ```
 
-— the same data Claude Code's `/usage` command shows. The token is only ever
-sent to `api.anthropic.com`; nothing is stored, logged, or sent anywhere else.
-Preferences (weekly toggle, used/remaining) live in `UserDefaults`.
+which is the same data behind Claude Code's `/usage` command. The token is sent only to
+`api.anthropic.com`. Nothing is written to disk except your preferences and the last
+usage values (in `UserDefaults`), and no analytics or third-party services are involved.
 
-## Accounts
-
-The app has no login of its own. It shows the limits of **the account Claude Code
-is currently signed into on this Mac**, and displays that account (email · plan)
-at the top of the panel and in Settings, so you always know which one you are looking at.
-
-- **Switching accounts** (`claude /login`, or any account-switcher that swaps the
-  Keychain login): the bar follows on the next refresh. Cached numbers belong to
-  one account and are never shown for another.
-- **Separate config folders** (`CLAUDE_CONFIG_DIR`): pick the folder in
-  *Settings → Account* (it reads `<folder>/.credentials.json` and `.claude.json`).
-- **One account at a time.** Showing several accounts side by side is not supported yet.
-- API-key / Console logins have no subscription limits, so there is nothing to show for them.
+The token is re-read on every refresh, so a token renewed by Claude Code or a different
+signed-in account is picked up automatically. The app never refreshes tokens itself, to
+avoid interfering with Claude Code.
 
 ## Rate limiting
 
-The usage endpoint is rate-limited by the server, so the app is deliberately gentle:
+The usage endpoint is rate-limited by the server, so requests are throttled by design:
 
-- every request goes through one gate: at most one per refresh interval (default 2 min),
-  **also across app restarts** — relaunching never triggers an extra request
-- the last values are cached on disk and shown instantly at launch
-- on HTTP 429 it backs off exponentially (2 → 4 → 8 → 16 → 30 min, honoring `Retry-After`),
-  keeps showing the last value, and retries automatically when the back-off ends
-- the manual refresh button is limited to once per 15 s and never overrides a back-off
+- All refreshes (timer, opening the panel, wake from sleep, the refresh button, app launch)
+  pass through a single gate that allows at most one request per refresh interval
+  (default: 2 minutes). The gate survives app restarts, so relaunching never causes an extra request.
+- The last values are cached on disk and shown immediately at launch.
+- On HTTP 429 the app backs off exponentially (2, 4, 8, 16, then 30 minutes, honoring
+  `Retry-After`), keeps showing the last known values and retries automatically when the
+  back-off ends.
+- The manual refresh button is limited to once every 15 seconds and never overrides a back-off.
 
-## Caveats
+## Limitations
 
-- This endpoint is **undocumented/unofficial** and may change or break at any
-  time. If it does, the bar shows `⚠︎`.
-- The app never refreshes the token itself (to avoid clashing with Claude Code).
-  If the token has expired, open Claude Code once and it will refresh.
-- Only subscription (Pro/Max) logins expose these limits; API-key-only setups
-  have nothing to show.
-- Not affiliated with or endorsed by Anthropic.
+- The usage endpoint is undocumented and may change or stop working at any time.
+  When a request fails, the bar shows a warning symbol next to the last known value.
+- If the stored token has expired, open Claude Code once so it can renew the token.
+- The weekly figure and reset times depend on what the server returns for your plan.
 
 ## Uninstall
 
-Quit from the menu, turn off *Launch at login*, delete the app.
+Quit from the right-click menu, turn off *Launch at login* in Settings, then delete
+`ClaudeUsageBar.app`. Preferences can be removed with
+`defaults delete io.github.claude-usage-bar`.
 
 ## Contributing
 
-Single file ([main.swift](main.swift), SwiftUI + AppKit). `--open-popover` / `--open-settings` launch flags open the UI directly, handy for screenshots. PRs welcome — translations, Opus/Sonnet
-per-model limits, notifications at thresholds, etc.
+The app is a single file, [`main.swift`](main.swift), built with SwiftUI and AppKit.
+Issues and pull requests are welcome, for example translations, per-model limits or
+threshold notifications.
+
+For UI work, the app accepts two launch flags that open the panel or the settings window
+directly: `--open-popover` and `--open-settings`.
+
+## Disclaimer
+
+This is an independent project and is not affiliated with or endorsed by Anthropic.
 
 ## License
 
-MIT
+[MIT](LICENSE)
