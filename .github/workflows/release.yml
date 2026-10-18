@@ -1,0 +1,23 @@
+name: Build & release
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build universal app
+        run: ./build.sh "$PWD/build"
+      - name: Zip
+        run: ditto -c -k --keepParent build/ClaudeUsageBar.app ClaudeUsageBar.zip
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ClaudeUsageBar.zip
