@@ -113,14 +113,21 @@ GET https://api.anthropic.com/api/oauth/usage
 ```
 
 which is the same data behind Claude Code's `/usage` command. The token is sent only to
-`api.anthropic.com`. Nothing is written to disk except your preferences and the last
+`api.anthropic.com` (and to `platform.claude.com` when it is renewed). Nothing is written to disk except your preferences and the last
 usage values (in `UserDefaults`) and the private account folders that Claude Code fills when you
-sign in. No analytics or third-party services are involved.
+sign in (the app adds the renewed login there). No analytics or third-party services are involved.
 
-The token is re-read on every refresh, so a token renewed by Claude Code is picked up
-automatically. The app never refreshes tokens itself. When the server rejects a token (HTTP 401),
-the app asks Claude Code to look at that login (`claude auth status`) and tries once more; if that
-does not help, the account shows *Sign in again*.
+### Staying signed in
+
+Access tokens last about 8 hours. The app renews them itself, shortly before they expire (or when
+the server answers 401), with the refresh token Claude Code stored at sign-in. This is the same request
+Claude Code makes: `POST https://platform.claude.com/v1/oauth/token`. The refresh token rolls forward with
+every renewal (about 30 days each time), so an account stays signed in for as long as the app runs
+now and then. The renewed login is saved in `<account folder>/.credentials.json` (owner-only) and is used
+in preference to the older Keychain copy; a new sign-in replaces it.
+
+Only if the refresh token is revoked or has gone unused for about a month (for example after signing out
+of all sessions on claude.ai, or a month without the app running) does the account show *Sign in again*.
 
 ## Rate limiting
 
@@ -142,8 +149,8 @@ The usage endpoint is rate-limited by the server, so requests are throttled by d
   When a request fails, the bar shows a warning symbol next to the last known value.
 - Signing in needs Claude Code installed (the app looks for `claude` in `~/.local/bin`, Homebrew,
   the editor extension and your login shell's PATH).
-- Accounts added with *Add account…* are used only by this app, so nothing else renews their token.
-  If a login expires, use *Sign in again*.
+- Renewing tokens relies on the same undocumented OAuth endpoint Claude Code uses, so it may change.
+  A login that can no longer be renewed needs *Sign in again*.
 - The weekly figure and reset times depend on what the server returns for your plan.
 
 ## Uninstall

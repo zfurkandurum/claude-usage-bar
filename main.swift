@@ -59,11 +59,22 @@ enum UsageError: Error { case noCredentials, http(Int), rateLimited(TimeInterval
 // MARK: - API
 
 final class UsageClient {
-    private func creds(from data: Data) -> (token: String, plan: String?)? {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let oauth = json["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String else { return nil }
-        return (token, (oauth["subscriptionType"] as? String)?.capitalized)
+    /// What Claude Code stores for one login: the credentials JSON with its `claudeAiOauth` entry.
+    private struct Creds {
+        var root: [String: Any]
+        var oauth: [String: Any] { root["claudeAiOauth"] as? [String: Any] ?? [:] }
+        var token: String { oauth["accessToken"] as? String ?? "" }
+        var refresh: String? { (oauth["refreshToken"] as? String).flatMap { $0.isEmpty ? nil : $0 } }
+        var expiresAt: Date? { (oauth["expiresAt"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue / 1000) } }
+        var plan: String? { (oauth["subscriptionType"] as? String)?.capitalized }
+        var scopes: [String] { oauth["scopes"] as? [String] ?? [] }
+    }
+
+    private func parseCreds(_ data: Data) -> Creds? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let oauth = root["claudeAiOauth"] as? [String: Any],
+              oauth["accessToken"] is String else { return nil }
+        return Creds(root: root)
     }
 
     static func normDir(_ d: String) -> String {
@@ -108,19 +119,72 @@ final class UsageClient {
         return p.terminationStatus == 0 ? data : nil
     }
 
-    private func fileCreds(_ dir: String) -> (token: String, plan: String?)? {
-        FileManager.default.contents(atPath: dir + "/.credentials.json").flatMap { creds(from: $0) }
+    /// The login of a folder lives in the macOS Keychain (written by Claude Code at sign-in) and, once the
+    /// app has renewed it, in `<dir>/.credentials.json`. The newer of the two wins. A folder never falls back
+    /// to another login, so one account is never shown under another's name.
+    private func readCreds(dir: String) -> Creds? {
+        let file = FileManager.default.contents(atPath: dir + "/.credentials.json").flatMap(parseCreds)
+        let key = keychain(service: Self.keychainService(forDir: dir)).flatMap(parseCreds)
+        return [file, key].compactMap { $0 }.max { ($0.expiresAt ?? .distantPast) < ($1.expiresAt ?? .distantPast) }
     }
 
-    /// The login of an account lives in the macOS Keychain (or in
-    /// `<config dir>/.credentials.json`). Re-read on every refresh so tokens that
-    /// Claude Code has refreshed are picked up automatically. A folder never falls
-    /// back to another login, so one account is never shown under another's name.
-    private func readCreds(configDir: String?) throws -> (token: String, plan: String?) {
-        guard let dir = Self.resolveDir(configDir) else { throw UsageError.noCredentials }
-        if let r = fileCreds(dir) { return r }
-        if let data = keychain(service: Self.keychainService(forDir: dir)), let r = creds(from: data) { return r }
-        throw UsageError.noCredentials
+    /// Keeps the renewed login next to the account's other files (owner-only). The refresh token rotates, so
+    /// this is written atomically before anything else uses the new tokens.
+    private func store(_ c: Creds, dir: String) -> Bool {
+        guard let data = try? JSONSerialization.data(withJSONObject: c.root) else { return false }
+        let path = dir + "/.credentials.json", tmp = path + ".tmp"
+        guard FileManager.default.createFile(atPath: tmp, contents: data, attributes: [.posixPermissions: 0o600]) else { return false }
+        return rename(tmp, path) == 0
+    }
+
+    private func send(_ req: URLRequest) -> (data: Data?, resp: HTTPURLResponse?, err: Error?) {
+        let sem = DispatchSemaphore(value: 0)
+        var out: (data: Data?, resp: HTTPURLResponse?, err: Error?) = (nil, nil, nil)
+        URLSession.shared.dataTask(with: req) { d, r, e in
+            out = (d, r as? HTTPURLResponse, e)
+            sem.signal()
+        }.resume()
+        sem.wait()
+        return out
+    }
+
+    private static let clientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"   // Claude Code's public OAuth client
+
+    /// Trades the refresh token for a new access token, the same call Claude Code makes itself. Access tokens
+    /// last about 8 hours; the refresh token rolls forward with every renewal, so a login keeps going as long
+    /// as the app can renew it at least once in a while.
+    private func renew(_ c: Creds, dir: String) -> Result<Creds, UsageError> {
+        guard let rt = c.refresh else { return .failure(.http(401)) }
+        var req = URLRequest(url: URL(string: "https://platform.claude.com/v1/oauth/token")!)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 20
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("claude-code/2.0", forHTTPHeaderField: "User-Agent")
+        var body: [String: Any] = ["grant_type": "refresh_token", "refresh_token": rt, "client_id": Self.clientID]
+        if !c.scopes.isEmpty { body["scope"] = c.scopes.joined(separator: " ") }
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        let r = send(req)
+        guard r.err == nil, let http = r.resp else { return .failure(.network) }
+        switch http.statusCode {
+        case 200: break
+        case 400, 401: return .failure(.http(401))   // refresh token revoked or expired: signing in again is the only way
+        case 429: return .failure(.rateLimited(TimeInterval(http.value(forHTTPHeaderField: "Retry-After") ?? "")))
+        default: return .failure(.http(http.statusCode))
+        }
+        guard let data = r.data, let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let access = j["access_token"] as? String else { return .failure(.parse) }
+        let now = Date().timeIntervalSince1970 * 1000
+        var oauth = c.oauth
+        oauth["accessToken"] = access
+        oauth["refreshToken"] = (j["refresh_token"] as? String) ?? rt
+        if let n = j["expires_in"] as? NSNumber { oauth["expiresAt"] = Int64(now + n.doubleValue * 1000) }
+        if let n = j["refresh_token_expires_in"] as? NSNumber { oauth["refreshTokenExpiresAt"] = Int64(now + n.doubleValue * 1000) }
+        if let sc = j["scope"] as? String, !sc.isEmpty { oauth["scopes"] = sc.split(separator: " ").map(String.init) }
+        var root = c.root
+        root["claudeAiOauth"] = oauth
+        let renewed = Creds(root: root)
+        guard store(renewed, dir: dir) else { return .failure(.parse) }
+        return .success(renewed)
     }
 
     private func parse(_ d: Any?) -> Limit? {
@@ -134,31 +198,50 @@ final class UsageClient {
         return Limit(utilization: u, resetsAt: date)
     }
 
+    private func fetchUsage(token: String) -> Result<[String: Any], UsageError> {
+        var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
+        req.timeoutInterval = 15
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        req.setValue("claude-code/2.0", forHTTPHeaderField: "User-Agent")
+        let r = send(req)
+        if r.err != nil { return .failure(.network) }
+        if let http = r.resp {
+            if http.statusCode == 429 { return .failure(.rateLimited(TimeInterval(http.value(forHTTPHeaderField: "Retry-After") ?? ""))) }
+            if http.statusCode != 200 { return .failure(.http(http.statusCode)) }
+        }
+        guard let data = r.data, let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return .failure(.parse) }
+        return .success(j)
+    }
+
+    private func fetchSync(configDir: String?) -> Result<Fetched, UsageError> {
+        guard let dir = Self.resolveDir(configDir), var c = readCreds(dir: dir) else { return .failure(.noCredentials) }
+        var renewed = false
+        // Renew shortly before the access token runs out, so the login never lapses.
+        if c.refresh != nil, (c.expiresAt ?? .distantFuture).timeIntervalSinceNow < 600 {
+            switch renew(c, dir: dir) {
+            case .success(let n): c = n; renewed = true
+            case .failure(let e): if (c.expiresAt ?? .distantFuture) <= Date() { return .failure(e) }   // else the old token still works
+            }
+        }
+        var out = fetchUsage(token: c.token)
+        if case .failure(.http(401)) = out, !renewed, c.refresh != nil, case .success(let n) = renew(c, dir: dir) {
+            c = n
+            out = fetchUsage(token: c.token)
+        }
+        switch out {
+        case .failure(let e): return .failure(e)
+        case .success(let j):
+            var acct = Self.accountFromFile(configDir: configDir) ?? Account()
+            acct.plan = c.plan
+            return .success(Fetched(usage: Usage(fiveHour: parse(j["five_hour"]), sevenDay: parse(j["seven_day"])), account: acct))
+        }
+    }
+
     func fetch(configDir: String?, completion: @escaping (Result<Fetched, UsageError>) -> Void) {
         DispatchQueue.global(qos: .utility).async {
-            let token: String, plan: String?
-            do { (token, plan) = try self.readCreds(configDir: configDir) } catch {
-                return DispatchQueue.main.async { completion(.failure(.noCredentials)) }
-            }
-            var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
-            req.timeoutInterval = 15
-            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-            req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-            req.setValue("claude-code/2.0", forHTTPHeaderField: "User-Agent")
-            URLSession.shared.dataTask(with: req) { data, resp, err in
-                let result: Result<Fetched, UsageError>
-                if err != nil { result = .failure(.network) }
-                else if let http = resp as? HTTPURLResponse, http.statusCode == 429 {
-                    result = .failure(.rateLimited(TimeInterval(http.value(forHTTPHeaderField: "Retry-After") ?? "")))
-                }
-                else if let code = (resp as? HTTPURLResponse)?.statusCode, code != 200 { result = .failure(.http(code)) }
-                else if let data, let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                    var acct = Self.accountFromFile(configDir: configDir) ?? Account()
-                    acct.plan = plan
-                    result = .success(Fetched(usage: Usage(fiveHour: self.parse(j["five_hour"]), sevenDay: self.parse(j["seven_day"])), account: acct))
-                } else { result = .failure(.parse) }
-                DispatchQueue.main.async { completion(result) }
-            }.resume()
+            let result = self.fetchSync(configDir: configDir)
+            DispatchQueue.main.async { completion(result) }
         }
     }
 }
@@ -384,7 +467,6 @@ final class Tracker: ObservableObject, Identifiable {
     private var inFlight = false
     private var gen = 0            // bumped when the folder changes, so stale responses are dropped
     private var removed = false
-    private var authRetried = false   // one automatic look after a 401 (Claude Code may refresh the login)
     private var retry: DispatchWorkItem?
 
     static func key(_ id: UUID) -> String { "acct.\(id.uuidString)" }
@@ -466,7 +548,6 @@ final class Tracker: ObservableObject, Identifiable {
 
     /// A new sign-in finished for this account: clear the old error and look again right away.
     func signedIn(_ acct: Account) {
-        authRetried = false
         lastError = nil
         if acct.email != account?.email { usage = nil }
         account = acct
@@ -493,7 +574,7 @@ final class Tracker: ObservableObject, Identifiable {
     /// app launch) goes through here, so the server is never hit more than once per
     /// refresh interval per account — even across app restarts — and a 429 backs off exponentially.
     func refresh(force: Bool = false) {
-        guard !removed, !inFlight, !isBackingOff else { return }
+        guard !removed, !inFlight, !isBackingOff, force || !needsSignIn else { return }
         let now = Date()
         let minGap: TimeInterval = force ? 15 : TimeInterval(interval) * 0.9
         guard now.timeIntervalSince(lastFetch) >= minGap else { return }
@@ -515,18 +596,9 @@ final class Tracker: ObservableObject, Identifiable {
                 self.lastError = nil
                 self.lastUpdate = Date()
                 self.failStreak = 0
-                self.authRetried = false
             case .failure(let e):
                 self.lastError = e   // keep showing the last known usage
-                if case .http(401) = e, !self.authRetried {
-                    // Let Claude Code look at the login (it renews expired tokens), then try once more.
-                    self.authRetried = true
-                    AuthCLI.status(dir: self.source.configDir) { [weak self] _ in
-                        guard let self, self.gen == g else { return }
-                        self.lastFetch = .distantPast
-                        self.refresh(force: true)
-                    }
-                } else if case .rateLimited(let after) = e {
+                if case .rateLimited(let after) = e {
                     self.failStreak += 1
                     let exp = min(120 * pow(2, Double(self.failStreak - 1)), 1800)   // 2, 4, 8, 16, 30 min
                     self.backoffUntil = Date().addingTimeInterval(max(after ?? 0, exp) + Double.random(in: 0...15))
@@ -697,6 +769,7 @@ final class Model: ObservableObject {
         AuthCLI.status(dir: s.dir) { [weak self] st in
             guard let self, self.login === s else { return }
             guard let st, st.loggedIn else { s.state = .failed(L("Sign-in did not complete.", "Giriş tamamlanmadı.")); return }
+            try? FileManager.default.removeItem(atPath: s.dir + "/.credentials.json")   // the new login is in the Keychain
             let acct = Account(email: st.email, plan: st.plan)
             if let id = s.existing, let t = self.trackers.first(where: { $0.id == id }) {
                 t.signedIn(acct)
